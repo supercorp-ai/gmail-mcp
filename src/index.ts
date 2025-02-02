@@ -86,6 +86,7 @@ const sendEmail = async (to: string, subject: string, body: string) => {
 const getAuthUrl = (): string =>
   oAuth2Client.generateAuthUrl({
     access_type: 'offline',
+    prompt: 'consent',
     scope: [
       'https://www.googleapis.com/auth/gmail.send',
       'https://www.googleapis.com/auth/gmail.readonly'
