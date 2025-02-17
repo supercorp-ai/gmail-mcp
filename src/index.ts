@@ -24,6 +24,7 @@ const CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ''
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || ''
 const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || ''
 const REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || ''
+const STATE = process.env.GOOGLE_STATE || ''
 
 const oauth2Client = new OAuth2Client(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI)
 if (REFRESH_TOKEN) {
@@ -89,7 +90,8 @@ function getAuthUrl(): string {
   return oauth2Client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
-    scope: SCOPES
+    scope: SCOPES,
+    state: STATE,
   })
 }
 async function exchangeAuthCode(code: string): Promise<string> {
