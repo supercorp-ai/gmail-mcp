@@ -10,6 +10,10 @@ import { z } from 'zod'
 import { google, gmail_v1 } from 'googleapis'
 import { OAuth2Client } from 'google-auth-library'
 import { createMimeMessage } from 'mimetext' // You can install a helper, or build raw base64 yourself
+import { unified } from 'unified'
+import rehypeParse from 'rehype-parse'
+import rehypeRemark from 'rehype-remark'
+import remarkStringify from 'remark-stringify'
 
 /* ------------------------------------------------------------------
  * Logging
@@ -35,6 +39,15 @@ if (REFRESH_TOKEN) {
 }
 
 const gmail = google.gmail({ version: 'v1', auth: oauth2Client })
+
+function htmlToMarkdown(html: string) {
+  const file = unified()
+    .use(rehypeParse, { fragment: true })  // Parse HTML input
+    .use(rehypeRemark)                     // Convert to remark (Markdown) AST
+    .use(remarkStringify)                  // Stringify the AST to Markdown text
+    .processSync(html)
+  return String(file)
+}
 
 /* ------------------------------------------------------------------
  * MCP-friendly JSON response (always "type": "text")
@@ -169,9 +182,21 @@ async function readEmail(messageId: string) {
   })
 
   if (resp.data.payload) {
-    const decoded = collectParts(resp.data.payload)
-    ;(resp.data as any).decodedParts = decoded
+    let decoded = collectParts(resp.data.payload);
+    // Convert any HTML parts to Markdown
+    decoded = decoded.map(part => {
+      if (part.mimeType && part.mimeType.startsWith('text/html')) {
+        return {
+          ...part,
+          text: htmlToMarkdown(part.text),
+          mimeType: 'text/markdown'
+        };
+      }
+      return part;
+    });
+    (resp.data as any).decodedParts = decoded;
   }
+
   return toTextJson(resp.data)
 }
 
@@ -230,7 +255,6 @@ function buildMimeMessage({
   isHtml?: boolean
 }): string {
   const msg = createMimeMessage()
-  msg.setSender('me <me@gmail.com>') // "From" can be changed
   msg.setTo(to)
   if (cc) msg.setCc(cc)
   if (bcc) msg.setBcc(bcc)

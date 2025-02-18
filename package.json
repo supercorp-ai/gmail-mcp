@@ -1,6 +1,6 @@
 {
   "name": "@supercorp/gmail-mcp",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -23,6 +23,10 @@
     "google-auth-library": "^9.15.1",
     "googleapis": "^144.0.0",
     "mimetext": "^3.0.24",
+    "rehype-parse": "^9.0.1",
+    "rehype-remark": "^10.0.0",
+    "remark-stringify": "^11.0.0",
+    "unified": "^11.0.5",
     "yargs": "^17.7.2",
     "zod": "^3.24.1"
   },
