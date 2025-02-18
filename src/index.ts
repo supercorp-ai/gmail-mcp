@@ -48,7 +48,6 @@ const gmail = google.gmail({ version: 'v1', auth: oauth2Client })
 
 // Custom plugin to drop unsupported nodes
 const dropUnsupportedNodes = () => {
-  // Whitelist of supported HTML elements – adjust as needed
   const whitelist = new Set([
     'html', 'head', 'body',
     'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
@@ -74,23 +73,29 @@ const dropUnsupportedNodes = () => {
 const convertHtmlToMarkdown = (html: string) => {
   const file = unified()
     .use(rehypeParse, { fragment: true })
-    .use(dropUnsupportedNodes) // Drop unsupported nodes rather than erroring out
+    .use(dropUnsupportedNodes)
     .use(rehypeRemark)
-    .use(remarkGfm)           // Add GitHub-flavored Markdown support (tables, task lists, etc.)
+    .use(remarkGfm)
     .use(remarkStringify)
     .processSync(html)
   return String(file)
 }
 
 // -------------------------------
+// Additional cleanup: remove HTML comments and collapse excessive newlines
+// -------------------------------
+const cleanMarkdown = (markdown: string): string => {
+  let cleaned = markdown.replace(/<!--[\s\S]*?-->/g, '')
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n')
+  return cleaned.trim()
+}
+
+// -------------------------------
 // Helpers to extract only important info from messages/drafts
 // -------------------------------
-
-// Given an array of headers, get the value by name (case-insensitive)
 const getHeaderValue = (headers: any[], name: string) =>
   headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || ''
 
-// Collect all text parts from a message part payload
 const decodeBase64Url = (encoded: string): string => {
   const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/')
   return Buffer.from(base64, 'base64').toString('utf8')
@@ -113,7 +118,6 @@ const collectParts = (payload?: gmail_v1.Schema$MessagePart): { mimeType?: strin
   return results
 }
 
-// Extract only the key details from a full Gmail message
 const extractImportantInfo = (message: gmail_v1.Schema$Message) => {
   const headers = message.payload?.headers || []
   const subject = getHeaderValue(headers, 'Subject')
@@ -122,13 +126,13 @@ const extractImportantInfo = (message: gmail_v1.Schema$Message) => {
   const cc = getHeaderValue(headers, 'Cc')
   const bcc = getHeaderValue(headers, 'Bcc')
   const parts = collectParts(message.payload)
-  // Prefer HTML parts if available – convert to Markdown
   const htmlPart = parts.find(p => p.mimeType && p.mimeType.startsWith('text/html'))
   let body = htmlPart ? convertHtmlToMarkdown(htmlPart.text) : ''
-  // Otherwise use plain text (if available)
-  if (!body) {
+  if (body) {
+    body = cleanMarkdown(body)
+  } else {
     const textPart = parts.find(p => p.mimeType && p.mimeType.startsWith('text/'))
-    body = textPart ? textPart.text : ''
+    body = textPart ? cleanMarkdown(textPart.text) : ''
   }
   return {
     messageId: message.id,
@@ -160,7 +164,9 @@ const toTextJson = (data: unknown) => ({
 const getAuthUrl = (): string => {
   const SCOPES = [
     'https://www.googleapis.com/auth/gmail.send',
-    'https://www.googleapis.com/auth/gmail.readonly'
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.compose',
+    'https://www.googleapis.com/auth/gmail.modify'
   ]
   return oauth2Client.generateAuthUrl({
     access_type: 'offline',
@@ -228,7 +234,7 @@ const listEmails = async (args: ListEmailsArgs) => {
 }
 
 // -------------------------------
-// (4) readEmail: full message + decode and simplify response
+// (4) readEmail: full message + decode and simplify key fields
 // -------------------------------
 const readEmail = async (messageId: string) => {
   const resp = await gmail.users.messages.get({
@@ -264,16 +270,28 @@ const readDraft = async (draftId: string) => {
     id: draftId,
     format: 'full'
   })
-  // In drafts the message is nested inside resp.data.message
   const result = resp.data.message?.payload ? extractImportantInfo(resp.data.message) : { error: 'No payload found' }
   return toTextJson(result)
 }
 
 // -------------------------------
-// Utility: build raw base64 encoded email with optional sender
+// Retrieve the default sender from the authenticated user's profile
 // -------------------------------
-const buildMimeMessage = ({
-  sender, // optional sender; only needed if user wants to send from a specific email they own
+let cachedDefaultSender: string | null = null
+const getDefaultSender = async (): Promise<string> => {
+  if (cachedDefaultSender) return cachedDefaultSender
+  const profile = await gmail.users.getProfile({ userId: 'me' })
+  if (!profile.data.emailAddress) throw new Error('Could not retrieve default sender from profile.')
+  cachedDefaultSender = profile.data.emailAddress
+  return cachedDefaultSender
+}
+
+// -------------------------------
+// Utility: build raw base64 encoded email with required sender
+// -------------------------------
+// buildMimeMessage is now asynchronous because it may need to fetch the default sender
+const buildMimeMessage = async ({
+  sender,
   to,
   cc,
   bcc,
@@ -288,11 +306,11 @@ const buildMimeMessage = ({
   subject: string
   body: string
   isHtml?: boolean
-}) => {
+}): Promise<string> => {
+  const actualSender = sender || await getDefaultSender()
+  if (!actualSender) throw new Error('The "From" header is required.')
   const msg = createMimeMessage()
-  if (sender) {
-    msg.setSender(sender)
-  }
+  msg.setSender(actualSender)
   msg.setTo(to)
   if (cc) msg.setCc(cc)
   if (bcc) msg.setBcc(bcc)
@@ -323,7 +341,7 @@ interface DraftEmailArgs {
 }
 
 const draftEmail = async (args: DraftEmailArgs) => {
-  const raw = buildMimeMessage(args)
+  const raw = await buildMimeMessage(args)
   const resp = await gmail.users.drafts.create({
     userId: 'me',
     requestBody: {
@@ -339,7 +357,7 @@ interface UpdateDraftArgs extends DraftEmailArgs {
 
 const updateDraft = async (args: UpdateDraftArgs) => {
   const { draftId, ...rest } = args
-  const raw = buildMimeMessage(rest)
+  const raw = await buildMimeMessage(rest)
   const resp = await gmail.users.drafts.update({
     userId: 'me',
     id: draftId,
@@ -371,7 +389,7 @@ const sendEmail = async (args: SendEmailArgs) => {
     })
     return toTextJson(resp.data)
   }
-  const raw = buildMimeMessage(rest)
+  const raw = await buildMimeMessage(rest)
   const resp = await gmail.users.messages.send({
     userId: 'me',
     requestBody: { raw }
@@ -480,7 +498,7 @@ const createServerWithTools = (): McpServer => {
     'draft_email',
     'Create a new draft message',
     {
-      sender: z.string().optional(),
+      sender: z.string(),
       to: z.array(z.string()),
       subject: z.string(),
       body: z.string(),
@@ -502,7 +520,7 @@ const createServerWithTools = (): McpServer => {
     'Update an existing draft message',
     {
       draftId: z.string(),
-      sender: z.string().optional(),
+      sender: z.string(),
       to: z.array(z.string()),
       subject: z.string(),
       body: z.string(),
@@ -536,7 +554,7 @@ const createServerWithTools = (): McpServer => {
     'send_email',
     'Send an email (new or existing draft).',
     {
-      sender: z.string().optional(),
+      sender: z.string(),
       to: z.array(z.string()),
       subject: z.string(),
       body: z.string(),
