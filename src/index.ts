@@ -13,7 +13,9 @@ import { createMimeMessage } from 'mimetext' // You can install a helper, or bui
 import { unified } from 'unified'
 import rehypeParse from 'rehype-parse'
 import rehypeRemark from 'rehype-remark'
+import remarkGfm from 'remark-gfm'
 import remarkStringify from 'remark-stringify'
+import { visit, SKIP } from 'unist-util-visit'
 
 /* ------------------------------------------------------------------
  * Logging
@@ -40,11 +42,37 @@ if (REFRESH_TOKEN) {
 
 const gmail = google.gmail({ version: 'v1', auth: oauth2Client })
 
+const dropUnsupportedNodes = () => {
+  // Define a whitelist of supported HTML elements.
+  const whitelist = new Set([
+    'html', 'head', 'body',
+    'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'em', 'strong', 'a', 'blockquote',
+    'ul', 'ol', 'li',
+    'table', 'thead', 'tbody', 'tr', 'th', 'td',
+    'pre', 'code',
+    'img', 'br', 'hr',
+    'div', 'span'
+  ])
+  return (tree: any) => {
+    visit(tree, 'element', (node, index, parent) => {
+      if (node && node.tagName && !whitelist.has(node.tagName)) {
+        if (parent && Array.isArray(parent.children)) {
+          parent.children.splice(index, 1)
+          return SKIP
+        }
+      }
+    })
+  }
+}
+
 function htmlToMarkdown(html: string) {
   const file = unified()
-    .use(rehypeParse, { fragment: true })  // Parse HTML input
-    .use(rehypeRemark)                     // Convert to remark (Markdown) AST
-    .use(remarkStringify)                  // Stringify the AST to Markdown text
+    .use(rehypeParse, { fragment: true })
+    .use(dropUnsupportedNodes)
+    .use(rehypeRemark)
+    .use(remarkGfm)
+    .use(remarkStringify)
     .processSync(html)
   return String(file)
 }
