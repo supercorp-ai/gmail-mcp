@@ -665,11 +665,13 @@ const main = () => {
   app.post('/message', async (req: Request, res: Response) => {
     const sessionId = req.query.sessionId as string
     if (!sessionId) {
+      logErr('Missing sessionId')
       res.status(400).send({ error: 'Missing sessionId' })
       return
     }
     const target = sessions.find(s => s.transport.sessionId === sessionId)
     if (!target) {
+      logErr('No active session')
       res.status(404).send({ error: 'No active session' })
       return
     }
