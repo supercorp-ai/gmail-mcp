@@ -113,6 +113,18 @@ function decodeBase64Url(encoded: string): string {
   return Buffer.from(base64, 'base64').toString('utf8')
 }
 
+/**
+ * Grab a particular header's value, ignoring case for the name.
+ */
+function getHeaderValue(
+  headers: gmail_v1.Schema$MessagePartHeader[] | undefined,
+  headerName: string
+): string {
+  if (!headers) return ''
+  const found = headers.find(h => h.name?.toLowerCase() === headerName.toLowerCase())
+  return found?.value || ''
+}
+
 let cachedDefaultSender: string | null = null
 async function getDefaultSender(): Promise<string> {
   if (cachedDefaultSender) return cachedDefaultSender
@@ -224,17 +236,18 @@ async function readEmail(messageId: string) {
     id: messageId,
     format: 'full'
   })
-  if (!resp.data.payload) return toTextJson({ error: 'No payload' })
+  if (!resp.data.payload) {
+    return toTextJson({ error: 'No payload' })
+  }
 
-  // Convert HTML to MD and pull out common fields
-  const headers = resp.data.payload.headers || []
-  const subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || ''
-  const from = headers.find(h => h.name.toLowerCase() === 'from')?.value || ''
-  const to = headers.find(h => h.name.toLowerCase() === 'to')?.value || ''
+  const headers = resp.data.payload.headers
+  const subject = getHeaderValue(headers, 'subject')
+  const from    = getHeaderValue(headers, 'from')
+  const to      = getHeaderValue(headers, 'to')
 
-  // For demonstration, do a more thorough approach if you like
+  // We can gather any text parts
   const parts: { mimeType?: string; text: string }[] = []
-  const traverse = (p?: gmail_v1.Schema$MessagePart) => {
+  function traverse(p?: gmail_v1.Schema$MessagePart) {
     if (!p) return
     if (p.body?.data && p.mimeType?.startsWith('text/')) {
       parts.push({ mimeType: p.mimeType, text: decodeBase64Url(p.body.data) })
@@ -244,7 +257,9 @@ async function readEmail(messageId: string) {
   traverse(resp.data.payload)
 
   const html = parts.find(p => p.mimeType === 'text/html')?.text
-  const body = html ? cleanMarkdown(convertHtmlToMarkdown(html)) : (parts.find(p => p.mimeType === 'text/plain')?.text || '')
+  const body = html
+    ? cleanMarkdown(convertHtmlToMarkdown(html))
+    : (parts.find(p => p.mimeType === 'text/plain')?.text ?? '')
 
   return toTextJson({ messageId, subject, from, to, body })
 }
@@ -259,12 +274,17 @@ async function listDrafts({ maxResults = 10, query = '' }: { maxResults?: number
 }
 
 async function readDraft(draftId: string) {
-  const resp = await gmail.users.drafts.get({ userId: 'me', id: draftId, format: 'full' })
-  if (!resp.data.message?.payload) return toTextJson({ error: 'No payload' })
-
-  // Convert to a simplified format
-  const info = readEmail(resp.data.message.id!) // re-using above logic if you like
-  return info
+  // We can reuse readEmail to parse the payload, but first get the draft
+  const resp = await gmail.users.drafts.get({
+    userId: 'me',
+    id: draftId,
+    format: 'full'
+  })
+  if (!resp.data.message?.id) {
+    return toTextJson({ error: 'No message in draft' })
+  }
+  // Now fetch the message details with readEmail
+  return readEmail(resp.data.message.id)
 }
 
 async function draftEmail(args: {
@@ -309,6 +329,10 @@ async function deleteDraft(draftId: string) {
   return toTextJson({ success: true, deletedDraftId: draftId })
 }
 
+/**
+ * If a `draftId` is provided, it sends that existing draft.
+ * Otherwise, it builds a new raw message and sends that directly.
+ */
 async function sendEmailFull(args: {
   sender?: string
   to: string[]
@@ -327,7 +351,7 @@ async function sendEmailFull(args: {
     })
     return toTextJson(resp.data)
   }
-  // Or build from scratch
+  // Build a brand-new message
   const raw = await buildMimeMessage(args)
   const resp = await gmail.users.messages.send({
     userId: 'me',
@@ -336,6 +360,10 @@ async function sendEmailFull(args: {
   return toTextJson(resp.data)
 }
 
+/**
+ * In "send-only" mode (gmail.send scope), we can't deal with drafts.
+ * So this always builds a fresh message.
+ */
 async function sendEmailOnly(args: {
   sender?: string
   to: string[]
@@ -345,7 +373,6 @@ async function sendEmailOnly(args: {
   body: string
   isHtml?: boolean
 }) {
-  // No draftId support
   const raw = await buildMimeMessage(args)
   const resp = await gmail.users.messages.send({
     userId: 'me',
@@ -526,7 +553,7 @@ function createMcpServer(sendOnly: boolean): McpServer {
     {
       draftId: z.string(),
       sender: z.string().optional(),
-      to: z.array(z.string()),
+      to: z.array(z.string()).optional(),
       cc: z.array(z.string()).optional(),
       bcc: z.array(z.string()).optional(),
       subject: z.string(),
