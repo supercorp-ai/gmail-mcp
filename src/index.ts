@@ -125,6 +125,7 @@ function getHeaderValue(
   return found?.value || ''
 }
 
+// buildMimeMessage now requires a sender to be provided
 async function buildMimeMessage({
   sender,
   to,
@@ -134,18 +135,16 @@ async function buildMimeMessage({
   body,
   isHtml
 }: {
-  sender?: string
-  to: string[]
-  cc?: string[]
-  bcc?: string[]
-  subject: string
-  body: string
-  isHtml?: boolean
+  sender: string;
+  to: string[];
+  cc?: string[];
+  bcc?: string[];
+  subject: string;
+  body: string;
+  isHtml?: boolean;
 }): Promise<string> {
   const msg = createMimeMessage()
-  if (sender) {
-    msg.setSender(sender)
-  }
+  msg.setSender(sender)
   msg.setTo(to)
   if (cc) msg.setCc(cc)
   if (bcc) msg.setBcc(bcc)
@@ -154,7 +153,7 @@ async function buildMimeMessage({
     contentType: isHtml ? 'text/html' : 'text/plain',
     data: body
   })
-  // Gmail raw format must be Base64URL. Mimetext uses standard base64 => convert
+  // Convert standard base64 to Base64URL format (required by Gmail API)
   const raw = msg.asEncoded()
   return raw
     .replace(/\+/g, '-')
@@ -176,8 +175,6 @@ function toTextJson(data: unknown) {
 // --------------------------------------------------------------------
 // 5) All methods that might be used (list, read, draft, send, etc.)
 // --------------------------------------------------------------------
-
-// -- Only used if not sendOnly --
 async function listEmails(args: {
   maxResults?: number
   labelIds?: string[]
@@ -199,7 +196,6 @@ async function listEmails(args: {
     return toTextJson(resp.data)
   }
 
-  // Optionally get partial metadata about each message (Subject, From, To, snippet)
   const enriched = []
   for (const m of resp.data.messages) {
     const detail = await gmail.users.messages.get({
@@ -237,7 +233,6 @@ async function readEmail(messageId: string) {
   const from    = getHeaderValue(headers, 'from')
   const to      = getHeaderValue(headers, 'to')
 
-  // We can gather any text parts
   const parts: { mimeType?: string; text: string }[] = []
   function traverse(p?: gmail_v1.Schema$MessagePart) {
     if (!p) return
@@ -266,7 +261,6 @@ async function listDrafts({ maxResults = 10, query = '' }: { maxResults?: number
 }
 
 async function readDraft(draftId: string) {
-  // We can reuse readEmail to parse the payload, but first get the draft
   const resp = await gmail.users.drafts.get({
     userId: 'me',
     id: draftId,
@@ -275,18 +269,17 @@ async function readDraft(draftId: string) {
   if (!resp.data.message?.id) {
     return toTextJson({ error: 'No message in draft' })
   }
-  // Now fetch the message details with readEmail
   return readEmail(resp.data.message.id)
 }
 
 async function draftEmail(args: {
-  sender?: string
-  to: string[]
-  cc?: string[]
-  bcc?: string[]
-  subject: string
-  body: string
-  isHtml?: boolean
+  sender: string;
+  to: string[];
+  cc?: string[];
+  bcc?: string[];
+  subject: string;
+  body: string;
+  isHtml?: boolean;
 }) {
   const raw = await buildMimeMessage(args)
   const resp = await gmail.users.drafts.create({
@@ -296,30 +289,19 @@ async function draftEmail(args: {
   return toTextJson(resp.data)
 }
 
-/**
- * Now to, cc, bcc are optional in the signature.
- * We'll default them to empty arrays if not provided.
- */
+// In updateDraft, "to" is now required.
 async function updateDraft(args: {
-  draftId: string
-  sender?: string
-  to?: string[]
-  cc?: string[]
-  bcc?: string[]
-  subject: string
-  body: string
-  isHtml?: boolean
+  draftId: string;
+  sender: string;
+  to: string[]; // now required
+  cc?: string[];
+  bcc?: string[];
+  subject: string;
+  body: string;
+  isHtml?: boolean;
 }) {
   const { draftId, ...rest } = args
-  const raw = await buildMimeMessage({
-    sender: rest.sender,
-    to: rest.to ?? [],
-    cc: rest.cc ?? [],
-    bcc: rest.bcc ?? [],
-    subject: rest.subject,
-    body: rest.body,
-    isHtml: rest.isHtml
-  })
+  const raw = await buildMimeMessage(rest)
   const resp = await gmail.users.drafts.update({
     userId: 'me',
     id: draftId,
@@ -333,29 +315,23 @@ async function deleteDraft(draftId: string) {
   return toTextJson({ success: true, deletedDraftId: draftId })
 }
 
-/**
- * If a `draftId` is provided, it sends that existing draft.
- * Otherwise, it builds a new raw message and sends that directly.
- */
 async function sendEmailFull(args: {
-  sender?: string
-  to: string[]
-  cc?: string[]
-  bcc?: string[]
-  subject: string
-  body: string
-  isHtml?: boolean
-  draftId?: string
+  sender: string;
+  to: string[];
+  cc?: string[];
+  bcc?: string[];
+  subject: string;
+  body: string;
+  isHtml?: boolean;
+  draftId?: string;
 }) {
   if (args.draftId) {
-    // Send existing draft
     const resp = await gmail.users.drafts.send({
       userId: 'me',
       requestBody: { id: args.draftId }
     })
     return toTextJson(resp.data)
   }
-  // Build a brand-new message
   const raw = await buildMimeMessage(args)
   const resp = await gmail.users.messages.send({
     userId: 'me',
@@ -364,18 +340,14 @@ async function sendEmailFull(args: {
   return toTextJson(resp.data)
 }
 
-/**
- * In "send-only" mode (gmail.send scope), we can't deal with drafts.
- * So this always builds a fresh message.
- */
 async function sendEmailOnly(args: {
-  sender?: string
-  to: string[]
-  cc?: string[]
-  bcc?: string[]
-  subject: string
-  body: string
-  isHtml?: boolean
+  sender: string;
+  to: string[];
+  cc?: string[];
+  bcc?: string[];
+  subject: string;
+  body: string;
+  isHtml?: boolean;
 }) {
   const raw = await buildMimeMessage(args)
   const resp = await gmail.users.messages.send({
@@ -443,13 +415,12 @@ function createMcpServer(sendOnly: boolean): McpServer {
     }
   )
 
-  // Always at least `send_email` in some form:
   if (sendOnly) {
     server.tool(
       'send_email',
       'Send an email using only the gmail.send scope (no draftId).',
       {
-        sender: z.string().optional(),
+        sender: z.string(),
         to: z.array(z.string()),
         cc: z.array(z.string()).optional(),
         bcc: z.array(z.string()).optional(),
@@ -533,7 +504,7 @@ function createMcpServer(sendOnly: boolean): McpServer {
     'draft_email',
     'Create a new draft',
     {
-      sender: z.string().optional(),
+      sender: z.string(),
       to: z.array(z.string()),
       cc: z.array(z.string()).optional(),
       bcc: z.array(z.string()).optional(),
@@ -550,15 +521,13 @@ function createMcpServer(sendOnly: boolean): McpServer {
     }
   )
 
-  // Notice we updated the Zod schema here: to, cc, bcc are optional
-  // so it matches the TypeScript function above
   server.tool(
     'update_draft',
     'Update an existing draft',
     {
       draftId: z.string(),
-      sender: z.string().optional(),
-      to: z.array(z.string()).optional(),
+      sender: z.string(),
+      to: z.array(z.string()), // now required
       cc: z.array(z.string()).optional(),
       bcc: z.array(z.string()).optional(),
       subject: z.string(),
@@ -591,7 +560,7 @@ function createMcpServer(sendOnly: boolean): McpServer {
     'send_email',
     'Send an email (new or existing draft).',
     {
-      sender: z.string().optional(),
+      sender: z.string(),
       to: z.array(z.string()),
       cc: z.array(z.string()).optional(),
       bcc: z.array(z.string()).optional(),
@@ -653,25 +622,21 @@ function main() {
   const server = createMcpServer(sendOnly)
 
   if (argv.transport === 'stdio') {
-    // STDIO transport
     const transport = new StdioServerTransport()
     void server.connect(transport)
     log('Listening on stdio')
     return
   }
 
-  // Otherwise SSE server
   const port = argv.port
   const app = express()
   let sessions: { server: McpServer; transport: SSEServerTransport }[] = []
 
-  // We'll only parse JSON for requests other than /message
   app.use((req, res, next) => {
     if (req.path === '/message') return next()
     express.json()(req, res, next)
   })
 
-  // SSE connect
   app.get('/', async (req: Request, res: Response) => {
     saveMachineId(req)
     const transport = new SSEServerTransport('/message', res)
@@ -696,7 +661,6 @@ function main() {
     })
   })
 
-  // SSE incoming messages
   app.post('/message', async (req: Request, res: Response) => {
     const sessionId = req.query.sessionId as string
     if (!sessionId) {
