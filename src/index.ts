@@ -304,10 +304,14 @@ async function draftEmail(args: {
   return toTextJson(resp.data)
 }
 
+/**
+ * Now to, cc, bcc are optional in the signature.
+ * We'll default them to empty arrays if not provided.
+ */
 async function updateDraft(args: {
   draftId: string
   sender?: string
-  to: string[]
+  to?: string[]
   cc?: string[]
   bcc?: string[]
   subject: string
@@ -315,7 +319,15 @@ async function updateDraft(args: {
   isHtml?: boolean
 }) {
   const { draftId, ...rest } = args
-  const raw = await buildMimeMessage(rest)
+  const raw = await buildMimeMessage({
+    sender: rest.sender,
+    to: rest.to ?? [],
+    cc: rest.cc ?? [],
+    bcc: rest.bcc ?? [],
+    subject: rest.subject,
+    body: rest.body,
+    isHtml: rest.isHtml
+  })
   const resp = await gmail.users.drafts.update({
     userId: 'me',
     id: draftId,
@@ -547,6 +559,8 @@ function createMcpServer(sendOnly: boolean): McpServer {
     }
   )
 
+  // Notice we updated the Zod schema here: to, cc, bcc are optional
+  // so it matches the TypeScript function above
   server.tool(
     'update_draft',
     'Update an existing draft',
