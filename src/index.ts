@@ -125,15 +125,6 @@ function getHeaderValue(
   return found?.value || ''
 }
 
-let cachedDefaultSender: string | null = null
-async function getDefaultSender(): Promise<string> {
-  if (cachedDefaultSender) return cachedDefaultSender
-  const profile = await gmail.users.getProfile({ userId: 'me' })
-  if (!profile.data.emailAddress) throw new Error('No default sender found in profile.')
-  cachedDefaultSender = profile.data.emailAddress
-  return cachedDefaultSender
-}
-
 async function buildMimeMessage({
   sender,
   to,
@@ -151,9 +142,10 @@ async function buildMimeMessage({
   body: string
   isHtml?: boolean
 }): Promise<string> {
-  const actualSender = sender || await getDefaultSender()
   const msg = createMimeMessage()
-  msg.setSender(actualSender)
+  if (sender) {
+    msg.setSender(sender)
+  }
   msg.setTo(to)
   if (cc) msg.setCc(cc)
   if (bcc) msg.setBcc(bcc)
@@ -424,32 +416,6 @@ function createMcpServer(sendOnly: boolean): McpServer {
     version: '1.0.0'
   })
 
-  // Always at least `send_email` in some form:
-  if (sendOnly) {
-    server.tool(
-      'send_email',
-      'Send an email using only the gmail.send scope (no draftId).',
-      {
-        sender: z.string().optional(),
-        to: z.array(z.string()),
-        cc: z.array(z.string()).optional(),
-        bcc: z.array(z.string()).optional(),
-        subject: z.string(),
-        body: z.string(),
-        isHtml: z.boolean().optional()
-      },
-      async (args) => {
-        try {
-          return await sendEmailOnly(args)
-        } catch (err: any) {
-          return toTextJson({ error: String(err.message) })
-        }
-      }
-    )
-    return server
-  }
-
-  // If NOT sendOnly, register everything
   server.tool(
     'auth_url',
     'Return an OAuth URL for the user to visit',
@@ -476,6 +442,31 @@ function createMcpServer(sendOnly: boolean): McpServer {
       }
     }
   )
+
+  // Always at least `send_email` in some form:
+  if (sendOnly) {
+    server.tool(
+      'send_email',
+      'Send an email using only the gmail.send scope (no draftId).',
+      {
+        sender: z.string().optional(),
+        to: z.array(z.string()),
+        cc: z.array(z.string()).optional(),
+        bcc: z.array(z.string()).optional(),
+        subject: z.string(),
+        body: z.string(),
+        isHtml: z.boolean().optional()
+      },
+      async (args) => {
+        try {
+          return await sendEmailOnly(args)
+        } catch (err: any) {
+          return toTextJson({ error: String(err.message) })
+        }
+      }
+    )
+    return server
+  }
 
   server.tool(
     'list_emails',
