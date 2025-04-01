@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-import yargs from 'yargs'
 import { hideBin } from 'yargs/helpers'
-import express, { Request, Response } from 'express'
+import yargs from 'yargs'
+import express, { Request, Response as ExpressResponse } from 'express'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -16,59 +16,128 @@ import rehypeRemark from 'rehype-remark'
 import remarkGfm from 'remark-gfm'
 import remarkStringify from 'remark-stringify'
 import { visit, SKIP } from 'unist-util-visit'
+import { Redis } from '@upstash/redis'
 
 // --------------------------------------------------------------------
-// 1) Parse CLI options
+// Configuration & Storage Interface
 // --------------------------------------------------------------------
-const argv = yargs(hideBin(process.argv))
-  .option('port', { type: 'number', default: 8000 })
-  .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
-  .option('send-only', {
-    type: 'boolean',
-    default: false,
-    describe: 'Only use https://www.googleapis.com/auth/gmail.send scope and expose only send_email'
-  })
-  .help()
-  .parseSync()
-
-const log = (...args: any[]) => console.log('[gmail-mcp]', ...args)
-const logErr = (...args: any[]) => console.error('[gmail-mcp]', ...args)
-
-const sendOnly = argv['send-only']
-
-// --------------------------------------------------------------------
-// 2) Determine scopes
-// --------------------------------------------------------------------
-const SCOPES = sendOnly
-  ? [ 'https://www.googleapis.com/auth/gmail.send' ]
-  : [
-      'https://www.googleapis.com/auth/gmail.send',
-      'https://www.googleapis.com/auth/gmail.readonly',
-      'https://www.googleapis.com/auth/gmail.compose',
-      'https://www.googleapis.com/auth/gmail.modify'
-    ]
-
-// --------------------------------------------------------------------
-// 3) Setup OAuth and Gmail
-// --------------------------------------------------------------------
-const CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ''
-const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || ''
-const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || ''
-const REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || ''
-const STATE = process.env.GOOGLE_STATE || ''
-
-const oauth2Client = new OAuth2Client(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI)
-if (REFRESH_TOKEN) {
-  oauth2Client.setCredentials({ refresh_token: REFRESH_TOKEN })
-  log('Using refresh token from env.')
-} else {
-  log('No refresh token in env. Provide at runtime or exchange_auth_code.')
+interface Config {
+  port: number;
+  transport: 'sse' | 'stdio';
+  storage: 'memory-single' | 'memory' | 'upstash-redis-rest';
+  // Gmail credentials (provided via CLI instead of env)
+  googleClientId: string;
+  googleClientSecret: string;
+  googleRedirectUri: string;
+  sendOnly: boolean;
+  googleState?: string;
+  // Storage options:
+  storageHeaderKey?: string;
+  upstashRedisRestUrl?: string;
+  upstashRedisRestToken?: string;
 }
 
-const gmail = google.gmail({ version: 'v1', auth: oauth2Client })
+interface Storage {
+  get(memoryKey: string): Promise<Record<string, any> | undefined>;
+  set(memoryKey: string, data: Record<string, any>): Promise<void>;
+}
 
 // --------------------------------------------------------------------
-// 4) Helpers (HTML-to-Markdown, building raw messages, etc.)
+// In-Memory Storage Implementation
+// --------------------------------------------------------------------
+class MemoryStorage implements Storage {
+  private storage: Record<string, Record<string, any>> = {};
+
+  async get(memoryKey: string) {
+    return this.storage[memoryKey];
+  }
+
+  async set(memoryKey: string, data: Record<string, any>) {
+    this.storage[memoryKey] = { ...this.storage[memoryKey], ...data };
+  }
+}
+
+// --------------------------------------------------------------------
+// Upstash Redis Storage Implementation
+// --------------------------------------------------------------------
+class RedisStorage implements Storage {
+  private redis: Redis;
+  private keyPrefix: string;
+
+  constructor(redisUrl: string, redisToken: string, keyPrefix: string) {
+    this.redis = new Redis({ url: redisUrl, token: redisToken });
+    this.keyPrefix = keyPrefix;
+  }
+
+  async get(memoryKey: string): Promise<Record<string, any> | undefined> {
+    const data = await this.redis.get<Record<string, any>>(`${this.keyPrefix}:${memoryKey}`);
+    return data === null ? undefined : data;
+  }
+
+  async set(memoryKey: string, data: Record<string, any>) {
+    const existing = (await this.get(memoryKey)) || {};
+    const newData = { ...existing, ...data };
+    await this.redis.set(`${this.keyPrefix}:${memoryKey}`, JSON.stringify(newData));
+  }
+}
+
+// --------------------------------------------------------------------
+// Gmail OAuth & API Helpers
+// --------------------------------------------------------------------
+function getScopes(sendOnly: boolean): string[] {
+  return sendOnly
+    ? [ 'https://www.googleapis.com/auth/gmail.send' ]
+    : [
+        'https://www.googleapis.com/auth/gmail.send',
+        'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/gmail.compose',
+        'https://www.googleapis.com/auth/gmail.modify'
+      ];
+}
+
+// Create an OAuth2 client using stored refresh token if available.
+async function createOAuth2Client(config: Config, storage: Storage, memoryKey: string): Promise<OAuth2Client> {
+  const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
+  const stored = await storage.get(memoryKey);
+  if (stored && stored.refreshToken) {
+    client.setCredentials({ refresh_token: stored.refreshToken });
+  }
+  return client;
+}
+
+async function getGmailClient(config: Config, storage: Storage, memoryKey: string): Promise<gmail_v1.Gmail> {
+  const oauth2Client = await createOAuth2Client(config, storage, memoryKey);
+  return google.gmail({ version: 'v1', auth: oauth2Client });
+}
+
+function getAuthUrl(config: Config, memoryKey: string, storage: Storage): string {
+  // Generate the auth URL using Google's OAuth2Client generateAuthUrl.
+  // Use offline access, prompt consent, and the appropriate scopes.
+  const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
+  const scopes = getScopes(config.sendOnly);
+  const url = client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    scope: scopes,
+    state: config.googleState
+  });
+  return url;
+}
+
+async function exchangeAuthCode(code: string, config: Config, storage: Storage, memoryKey: string): Promise<string> {
+  const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
+  const { tokens } = await client.getToken(code.trim());
+  if (!tokens.refresh_token) {
+    throw new Error('No refresh token returned by Google.');
+  }
+  client.setCredentials(tokens);
+  // Save the refresh token (and optionally access token) in storage.
+  await storage.set(memoryKey, { refreshToken: tokens.refresh_token, accessToken: tokens.access_token });
+  return tokens.refresh_token;
+}
+
+// --------------------------------------------------------------------
+// Helpers: HTML-to-Markdown, building MIME messages, etc.
 // --------------------------------------------------------------------
 function dropUnsupportedNodes() {
   const whitelist = new Set([
@@ -80,15 +149,15 @@ function dropUnsupportedNodes() {
     'pre', 'code',
     'img', 'br', 'hr',
     'div', 'span'
-  ])
+  ]);
   return (tree: any) => {
     visit(tree, 'element', (node, index, parent) => {
       if (node?.tagName && !whitelist.has(node.tagName)) {
-        parent?.children?.splice(index, 1)
-        return SKIP
+        parent?.children?.splice(index, 1);
+        return SKIP;
       }
-    })
-  }
+    });
+  };
 }
 
 function convertHtmlToMarkdown(html: string): string {
@@ -98,34 +167,30 @@ function convertHtmlToMarkdown(html: string): string {
     .use(rehypeRemark)
     .use(remarkGfm)
     .use(remarkStringify)
-    .processSync(html)
-  return String(file)
+    .processSync(html);
+  return String(file);
 }
 
 function cleanMarkdown(markdown: string): string {
-  let cleaned = markdown.replace(/<!--[\s\S]*?-->/g, '')
-  cleaned = cleaned.replace(/\n{3,}/g, '\n\n')
-  return cleaned.trim()
+  let cleaned = markdown.replace(/<!--[\s\S]*?-->/g, '');
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+  return cleaned.trim();
 }
 
 function decodeBase64Url(encoded: string): string {
-  const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/')
-  return Buffer.from(base64, 'base64').toString('utf8')
+  const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+  return Buffer.from(base64, 'base64').toString('utf8');
 }
 
-/**
- * Grab a particular header's value, ignoring case for the name.
- */
 function getHeaderValue(
   headers: gmail_v1.Schema$MessagePartHeader[] | undefined,
   headerName: string
 ): string {
-  if (!headers) return ''
-  const found = headers.find(h => h.name?.toLowerCase() === headerName.toLowerCase())
-  return found?.value || ''
+  if (!headers) return '';
+  const found = headers.find(h => h.name?.toLowerCase() === headerName.toLowerCase());
+  return found?.value || '';
 }
 
-// buildMimeMessage now requires a sender to be provided
 async function buildMimeMessage({
   sender,
   to,
@@ -143,133 +208,116 @@ async function buildMimeMessage({
   body: string;
   isHtml?: boolean;
 }): Promise<string> {
-  const msg = createMimeMessage()
-  msg.setSender(sender)
-  msg.setTo(to)
-  if (cc) msg.setCc(cc)
-  if (bcc) msg.setBcc(bcc)
-  msg.setSubject(subject)
+  const msg = createMimeMessage();
+  msg.setSender(sender);
+  msg.setTo(to);
+  if (cc) msg.setCc(cc);
+  if (bcc) msg.setBcc(bcc);
+  msg.setSubject(subject);
   msg.addMessage({
     contentType: isHtml ? 'text/html' : 'text/plain',
     data: body
-  })
-  // Convert standard base64 to Base64URL format (required by Gmail API)
-  const raw = msg.asEncoded()
-  return raw
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '')
-}
-
-function toTextJson(data: unknown) {
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify(data, null, 2)
-      }
-    ]
-  }
+  });
+  const raw = msg.asEncoded();
+  return raw.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 // --------------------------------------------------------------------
-// 5) All methods that might be used (list, read, draft, send, etc.)
+// Gmail API Methods
 // --------------------------------------------------------------------
 async function listEmails(args: {
-  maxResults?: number
-  labelIds?: string[]
-  query?: string
-  pageToken?: string
-  unreadOnly?: boolean
-}) {
-  const { maxResults = 10, labelIds, query, pageToken, unreadOnly = false } = args
-  const q = [query, unreadOnly ? 'is:unread' : null].filter(Boolean).join(' ')
+  maxResults?: number;
+  labelIds?: string[];
+  query?: string;
+  pageToken?: string;
+  unreadOnly?: boolean;
+}, config: Config, storage: Storage, memoryKey: string) {
+  const gmail = await getGmailClient(config, storage, memoryKey);
+  const { maxResults = 10, labelIds, query, pageToken, unreadOnly = false } = args;
+  const q = [query, unreadOnly ? 'is:unread' : null].filter(Boolean).join(' ');
   const resp = await gmail.users.messages.list({
     userId: 'me',
     maxResults,
     labelIds,
     pageToken,
     ...(q && { q })
-  })
-
+  });
   if (!resp.data.messages) {
-    return toTextJson(resp.data)
+    return toTextJson(resp.data);
   }
-
-  const enriched = []
+  const enriched = [];
   for (const m of resp.data.messages) {
     const detail = await gmail.users.messages.get({
       userId: 'me',
       id: m.id!,
       format: 'metadata',
       metadataHeaders: ['Subject', 'From', 'To']
-    })
+    });
     enriched.push({
       id: detail.data.id,
       threadId: detail.data.threadId,
       snippet: detail.data.snippet,
       headers: detail.data.payload?.headers
-    })
+    });
   }
   return toTextJson({
     nextPageToken: resp.data.nextPageToken,
     resultSizeEstimate: resp.data.resultSizeEstimate,
     messages: enriched
-  })
+  });
 }
 
-async function readEmail(messageId: string) {
+async function readEmail(messageId: string, config: Config, storage: Storage, memoryKey: string) {
+  const gmail = await getGmailClient(config, storage, memoryKey);
   const resp = await gmail.users.messages.get({
     userId: 'me',
     id: messageId,
     format: 'full'
-  })
+  });
   if (!resp.data.payload) {
-    return toTextJson({ error: 'No payload' })
+    return toTextJson({ error: 'No payload' });
   }
-
-  const headers = resp.data.payload.headers
-  const subject = getHeaderValue(headers, 'subject')
-  const from    = getHeaderValue(headers, 'from')
-  const to      = getHeaderValue(headers, 'to')
-
-  const parts: { mimeType?: string; text: string }[] = []
+  const headers = resp.data.payload.headers;
+  const subject = getHeaderValue(headers, 'subject');
+  const from    = getHeaderValue(headers, 'from');
+  const to      = getHeaderValue(headers, 'to');
+  const parts: { mimeType?: string; text: string }[] = [];
   function traverse(p?: gmail_v1.Schema$MessagePart) {
-    if (!p) return
+    if (!p) return;
     if (p.body?.data && p.mimeType?.startsWith('text/')) {
-      parts.push({ mimeType: p.mimeType, text: decodeBase64Url(p.body.data) })
+      parts.push({ mimeType: p.mimeType, text: decodeBase64Url(p.body.data) });
     }
-    p.parts?.forEach(traverse)
+    p.parts?.forEach(traverse);
   }
-  traverse(resp.data.payload)
-
-  const html = parts.find(p => p.mimeType === 'text/html')?.text
+  traverse(resp.data.payload);
+  const html = parts.find(p => p.mimeType === 'text/html')?.text;
   const body = html
     ? cleanMarkdown(convertHtmlToMarkdown(html))
-    : (parts.find(p => p.mimeType === 'text/plain')?.text ?? '')
-
-  return toTextJson({ messageId, subject, from, to, body })
+    : (parts.find(p => p.mimeType === 'text/plain')?.text ?? '');
+  return toTextJson({ messageId, subject, from, to, body });
 }
 
-async function listDrafts({ maxResults = 10, query = '' }: { maxResults?: number; query?: string }) {
+async function listDrafts(args: { maxResults?: number; query?: string }, config: Config, storage: Storage, memoryKey: string) {
+  const gmail = await getGmailClient(config, storage, memoryKey);
   const resp = await gmail.users.drafts.list({
     userId: 'me',
-    maxResults,
-    q: query
-  })
-  return toTextJson(resp.data)
+    maxResults: args.maxResults,
+    q: args.query
+  });
+  return toTextJson(resp.data);
 }
 
-async function readDraft(draftId: string) {
+async function readDraft(draftId: string, config: Config, storage: Storage, memoryKey: string) {
+  const gmail = await getGmailClient(config, storage, memoryKey);
   const resp = await gmail.users.drafts.get({
     userId: 'me',
     id: draftId,
     format: 'full'
-  })
+  });
   if (!resp.data.message?.id) {
-    return toTextJson({ error: 'No message in draft' })
+    return toTextJson({ error: 'No message in draft' });
   }
-  return readEmail(resp.data.message.id)
+  return readEmail(resp.data.message.id, config, storage, memoryKey);
 }
 
 async function draftEmail(args: {
@@ -280,39 +328,41 @@ async function draftEmail(args: {
   subject: string;
   body: string;
   isHtml?: boolean;
-}) {
-  const raw = await buildMimeMessage(args)
+}, config: Config, storage: Storage, memoryKey: string) {
+  const raw = await buildMimeMessage(args);
+  const gmail = await getGmailClient(config, storage, memoryKey);
   const resp = await gmail.users.drafts.create({
     userId: 'me',
     requestBody: { message: { raw } }
-  })
-  return toTextJson(resp.data)
+  });
+  return toTextJson(resp.data);
 }
 
-// In updateDraft, "to" is now required.
 async function updateDraft(args: {
   draftId: string;
   sender: string;
-  to: string[]; // now required
+  to: string[];
   cc?: string[];
   bcc?: string[];
   subject: string;
   body: string;
   isHtml?: boolean;
-}) {
-  const { draftId, ...rest } = args
-  const raw = await buildMimeMessage(rest)
+}, config: Config, storage: Storage, memoryKey: string) {
+  const { draftId, ...rest } = args;
+  const raw = await buildMimeMessage(rest);
+  const gmail = await getGmailClient(config, storage, memoryKey);
   const resp = await gmail.users.drafts.update({
     userId: 'me',
     id: draftId,
     requestBody: { message: { raw } }
-  })
-  return toTextJson(resp.data)
+  });
+  return toTextJson(resp.data);
 }
 
-async function deleteDraft(draftId: string) {
-  await gmail.users.drafts.delete({ userId: 'me', id: draftId })
-  return toTextJson({ success: true, deletedDraftId: draftId })
+async function deleteDraft(draftId: string, config: Config, storage: Storage, memoryKey: string) {
+  const gmail = await getGmailClient(config, storage, memoryKey);
+  await gmail.users.drafts.delete({ userId: 'me', id: draftId });
+  return toTextJson({ success: true, deletedDraftId: draftId });
 }
 
 async function sendEmailFull(args: {
@@ -324,20 +374,21 @@ async function sendEmailFull(args: {
   body: string;
   isHtml?: boolean;
   draftId?: string;
-}) {
+}, config: Config, storage: Storage, memoryKey: string) {
+  const gmail = await getGmailClient(config, storage, memoryKey);
   if (args.draftId) {
     const resp = await gmail.users.drafts.send({
       userId: 'me',
       requestBody: { id: args.draftId }
-    })
-    return toTextJson(resp.data)
+    });
+    return toTextJson(resp.data);
   }
-  const raw = await buildMimeMessage(args)
+  const raw = await buildMimeMessage(args);
   const resp = await gmail.users.messages.send({
     userId: 'me',
     requestBody: { raw }
-  })
-  return toTextJson(resp.data)
+  });
+  return toTextJson(resp.data);
 }
 
 async function sendEmailOnly(args: {
@@ -348,77 +399,72 @@ async function sendEmailOnly(args: {
   subject: string;
   body: string;
   isHtml?: boolean;
-}) {
-  const raw = await buildMimeMessage(args)
+}, config: Config, storage: Storage, memoryKey: string) {
+  const raw = await buildMimeMessage(args);
+  const gmail = await getGmailClient(config, storage, memoryKey);
   const resp = await gmail.users.messages.send({
     userId: 'me',
     requestBody: { raw }
-  })
-  return toTextJson(resp.data)
+  });
+  return toTextJson(resp.data);
+}
+
+function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(data, null, 2)
+      }
+    ]
+  };
 }
 
 // --------------------------------------------------------------------
-// 6) OAuth Tools
+// MCP Server Creation: Register Gmail Tools
 // --------------------------------------------------------------------
-function getAuthUrl(): string {
-  return oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    prompt: 'consent',
-    scope: SCOPES,
-    state: STATE
-  })
-}
-
-async function exchangeAuthCode(code: string): Promise<string> {
-  log(`Exchanging code: ${code}`)
-  const { tokens } = await oauth2Client.getToken(code.trim())
-  if (!tokens.refresh_token) {
-    throw new Error('No refresh token returned by Google.')
-  }
-  oauth2Client.setCredentials(tokens)
-  return tokens.refresh_token
-}
-
-// --------------------------------------------------------------------
-// 7) Create the MCP server, conditionally registering tools
-// --------------------------------------------------------------------
-function createMcpServer(sendOnly: boolean): McpServer {
+function createMcpServer(memoryKey: string, config: Config): McpServer {
   const server = new McpServer({
-    name: sendOnly ? 'Gmail MCP Server (Send-Only)' : 'Gmail MCP Server',
+    name: `Gmail MCP Server${config.sendOnly ? ' (Send-Only)' : ''} (Memory Key: ${memoryKey})`,
     version: '1.0.0'
-  })
+  });
+  // Helper: get the correct Storage instance.
+  const storage: Storage = config.storage === 'upstash-redis-rest'
+    ? new RedisStorage(config.upstashRedisRestUrl!, config.upstashRedisRestToken!, config.storageHeaderKey!)
+    : new MemoryStorage();
 
   server.tool(
     'auth_url',
-    'Return an OAuth URL for the user to visit',
+    'Return an OAuth URL for Gmail. Visit this URL to grant access.',
     {},
     async () => {
       try {
-        return toTextJson({ authUrl: getAuthUrl() })
+        const authUrl = getAuthUrl(config, memoryKey, storage);
+        return toTextJson({ authUrl });
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
   server.tool(
     'exchange_auth_code',
-    'Exchange an auth code for a refresh token',
+    'Exchange an auth code for a refresh token. This sets up Gmail authentication.',
     { code: z.string() },
-    async ({ code }) => {
+    async (args: { code: string }) => {
       try {
-        const token = await exchangeAuthCode(code)
-        return toTextJson({ refreshToken: token })
+        const token = await exchangeAuthCode(args.code, config, storage, memoryKey);
+        return toTextJson({ refreshToken: token });
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
-  if (sendOnly) {
+  if (config.sendOnly) {
     server.tool(
       'send_email',
-      'Send an email using only the gmail.send scope (no draftId).',
+      'Send an email using only the gmail.send scope (no draftId required).',
       {
         sender: z.string(),
         to: z.array(z.string()),
@@ -430,18 +476,18 @@ function createMcpServer(sendOnly: boolean): McpServer {
       },
       async (args) => {
         try {
-          return await sendEmailOnly(args)
+          return await sendEmailOnly(args, config, storage, memoryKey);
         } catch (err: any) {
-          return toTextJson({ error: String(err.message) })
+          return toTextJson({ error: String(err.message) });
         }
       }
-    )
-    return server
+    );
+    return server;
   }
 
   server.tool(
     'list_emails',
-    'List Gmail messages with snippet (supports pagination, etc.)',
+    'List Gmail messages (with snippets, pagination, etc.).',
     {
       maxResults: z.number().optional(),
       labelIds: z.array(z.string()).optional(),
@@ -451,25 +497,25 @@ function createMcpServer(sendOnly: boolean): McpServer {
     },
     async (args) => {
       try {
-        return await listEmails(args)
+        return await listEmails(args, config, storage, memoryKey);
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
   server.tool(
     'read_email',
-    'Fetch a single message in full, convert HTML to Markdown, etc.',
+    'Read a single Gmail message in full and convert HTML to Markdown.',
     { messageId: z.string() },
-    async ({ messageId }) => {
+    async (args: { messageId: string }) => {
       try {
-        return await readEmail(messageId)
+        return await readEmail(args.messageId, config, storage, memoryKey);
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
   server.tool(
     'list_drafts',
@@ -480,29 +526,29 @@ function createMcpServer(sendOnly: boolean): McpServer {
     },
     async (args) => {
       try {
-        return await listDrafts(args)
+        return await listDrafts(args, config, storage, memoryKey);
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
   server.tool(
     'read_draft',
-    'Fetch a single draft in full.',
+    'Read a single Gmail draft in full.',
     { draftId: z.string() },
-    async ({ draftId }) => {
+    async (args: { draftId: string }) => {
       try {
-        return await readDraft(draftId)
+        return await readDraft(args.draftId, config, storage, memoryKey);
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
   server.tool(
     'draft_email',
-    'Create a new draft',
+    'Create a new Gmail draft.',
     {
       sender: z.string(),
       to: z.array(z.string()),
@@ -514,20 +560,20 @@ function createMcpServer(sendOnly: boolean): McpServer {
     },
     async (args) => {
       try {
-        return await draftEmail(args)
+        return await draftEmail(args, config, storage, memoryKey);
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
   server.tool(
     'update_draft',
-    'Update an existing draft',
+    'Update an existing Gmail draft.',
     {
       draftId: z.string(),
       sender: z.string(),
-      to: z.array(z.string()), // now required
+      to: z.array(z.string()),
       cc: z.array(z.string()).optional(),
       bcc: z.array(z.string()).optional(),
       subject: z.string(),
@@ -536,29 +582,29 @@ function createMcpServer(sendOnly: boolean): McpServer {
     },
     async (args) => {
       try {
-        return await updateDraft(args)
+        return await updateDraft(args, config, storage, memoryKey);
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
   server.tool(
     'delete_draft',
-    'Delete a draft',
+    'Delete a Gmail draft.',
     { draftId: z.string() },
-    async ({ draftId }) => {
+    async (args: { draftId: string }) => {
       try {
-        return await deleteDraft(draftId)
+        return await deleteDraft(args.draftId, config, storage, memoryKey);
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
   server.tool(
     'send_email',
-    'Send an email (new or existing draft).',
+    'Send an email (new or via an existing draft).',
     {
       sender: z.string(),
       to: z.array(z.string()),
@@ -571,44 +617,42 @@ function createMcpServer(sendOnly: boolean): McpServer {
     },
     async (args) => {
       try {
-        return await sendEmailFull(args)
+        return await sendEmailFull(args, config, storage, memoryKey);
       } catch (err: any) {
-        return toTextJson({ error: String(err.message) })
+        return toTextJson({ error: String(err.message) });
       }
     }
-  )
+  );
 
-  return server
+  return server;
 }
 
 // --------------------------------------------------------------------
-// 8) Minimal Fly.io "replay" handling (optional).
+// Minimal Fly.io "replay" handling (optional)
 // --------------------------------------------------------------------
 function parseFlyReplaySrc(headerValue: string): Record<string, string> {
-  const regex = /(.*?)=(.*?)($|;)/g
-  const matches = headerValue.matchAll(regex)
-  const result: Record<string, string> = {}
+  const regex = /(.*?)=(.*?)($|;)/g;
+  const matches = headerValue.matchAll(regex);
+  const result: Record<string, string> = {};
   for (const match of matches) {
     if (match.length >= 3) {
-      const key = match[1].trim()
-      const value = match[2].trim()
-      result[key] = value
+      result[match[1].trim()] = match[2].trim();
     }
   }
-  return result
+  return result;
 }
-let machineId: string | null = null
+let machineId: string | null = null;
 function saveMachineId(req: Request) {
-  if (machineId) return
-  const headerKey = 'fly-replay-src'
-  const raw = req.headers[headerKey.toLowerCase()]
-  if (!raw || typeof raw !== 'string') return
+  if (machineId) return;
+  const headerKey = 'fly-replay-src';
+  const raw = req.headers[headerKey.toLowerCase()];
+  if (!raw || typeof raw !== 'string') return;
   try {
-    const parsed = parseFlyReplaySrc(raw)
+    const parsed = parseFlyReplaySrc(raw);
     if (parsed.state) {
-      const decoded = decodeURIComponent(parsed.state)
-      const obj = JSON.parse(decoded)
-      if (obj.machineId) machineId = obj.machineId
+      const decoded = decodeURIComponent(parsed.state);
+      const obj = JSON.parse(decoded);
+      if (obj.machineId) machineId = obj.machineId;
     }
   } catch {
     // ignore
@@ -616,75 +660,140 @@ function saveMachineId(req: Request) {
 }
 
 // --------------------------------------------------------------------
-// 9) Main: Start either SSE or stdio server
+// Main: Start the server (SSE or stdio)
 // --------------------------------------------------------------------
-function main() {
-  const server = createMcpServer(sendOnly)
+function main(): void {
+  const argv = yargs(hideBin(process.argv))
+    .option('port', { type: 'number', default: 8000 })
+    .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
+    .option('storage', {
+      type: 'string',
+      choices: ['memory-single', 'memory', 'upstash-redis-rest'],
+      default: 'memory-single',
+      describe:
+        'Choose storage backend: "memory-single" uses fixed single-user storage; "memory" uses multi-user in-memory storage (requires --storageHeaderKey); "upstash-redis-rest" uses Upstash Redis (requires --storageHeaderKey, --upstashRedisRestUrl, and --upstashRedisRestToken).'
+    })
+    .option('googleClientId', { type: 'string', demandOption: true, describe: "Google Client ID" })
+    .option('googleClientSecret', { type: 'string', demandOption: true, describe: "Google Client Secret" })
+    .option('googleRedirectUri', { type: 'string', demandOption: true, describe: "Google Redirect URI" })
+    .option('send-only', { type: 'boolean', default: false, describe: 'If true, only expose send_email tool (gmail.send scope only).' })
+    .option('googleState', { type: 'string', describe: "Optional Google OAuth state parameter" })
+    .option('storageHeaderKey', { type: 'string', describe: 'For storage "memory" or "upstash-redis-rest": the header name (or key prefix) to use.' })
+    .option('upstashRedisRestUrl', { type: 'string', describe: 'Upstash Redis REST URL (if --storage=upstash-redis-rest)' })
+    .option('upstashRedisRestToken', { type: 'string', describe: 'Upstash Redis REST token (if --storage=upstash-redis-rest)' })
+    .help()
+    .parseSync();
 
-  if (argv.transport === 'stdio') {
-    const transport = new StdioServerTransport()
-    void server.connect(transport)
-    log('Listening on stdio')
-    return
+  const config: Config = {
+    port: argv.port,
+    transport: argv.transport as 'sse' | 'stdio',
+    storage: argv.storage as 'memory-single' | 'memory' | 'upstash-redis-rest',
+    googleClientId: argv.googleClientId,
+    googleClientSecret: argv.googleClientSecret,
+    googleRedirectUri: argv.googleRedirectUri,
+    sendOnly: argv['send-only'],
+    googleState: argv.googleState,
+    storageHeaderKey:
+      (argv.storage === 'memory-single')
+        ? undefined
+        : (argv.storageHeaderKey && argv.storageHeaderKey.trim()
+            ? argv.storageHeaderKey.trim()
+            : (() => { console.error('Error: --storageHeaderKey is required for storage modes "memory" or "upstash-redis-rest".'); process.exit(1); return ''; })()),
+    upstashRedisRestUrl: argv.upstashRedisRestUrl,
+    upstashRedisRestToken: argv.upstashRedisRestToken,
+  };
+
+  if (config.storage === 'upstash-redis-rest') {
+    if (!config.upstashRedisRestUrl || !config.upstashRedisRestUrl.trim()) {
+      console.error("Error: --upstashRedisRestUrl is required for storage mode 'upstash-redis-rest'.");
+      process.exit(1);
+    }
+    if (!config.upstashRedisRestToken || !config.upstashRedisRestToken.trim()) {
+      console.error("Error: --upstashRedisRestToken is required for storage mode 'upstash-redis-rest'.");
+      process.exit(1);
+    }
   }
 
-  const port = argv.port
-  const app = express()
-  let sessions: { server: McpServer; transport: SSEServerTransport }[] = []
+  if (config.transport === 'stdio') {
+    const memoryKey = "single";
+    const server = createMcpServer(memoryKey, config);
+    const transport = new StdioServerTransport();
+    void server.connect(transport);
+    console.log('Listening on stdio');
+    return;
+  }
+
+  const app = express();
+  interface ServerSession {
+    memoryKey: string;
+    server: McpServer;
+    transport: SSEServerTransport;
+    sessionId: string;
+  }
+  let sessions: ServerSession[] = [];
 
   app.use((req, res, next) => {
-    if (req.path === '/message') return next()
-    express.json()(req, res, next)
-  })
+    if (req.path === '/message') return next();
+    express.json()(req, res, next);
+  });
 
-  app.get('/', async (req: Request, res: Response) => {
-    saveMachineId(req)
-    const transport = new SSEServerTransport('/message', res)
-    const mcpInstance = createMcpServer(sendOnly)
-    await mcpInstance.connect(transport)
-    sessions.push({ server: mcpInstance, transport })
-
-    const sessionId = transport.sessionId
-    log(`[${sessionId}] SSE connection established`)
-
+  app.get('/', async (req: Request, res: ExpressResponse) => {
+    saveMachineId(req);
+    let memoryKey: string;
+    if (config.storage === 'memory-single') {
+      memoryKey = "single";
+    } else {
+      const headerVal = req.headers[config.storageHeaderKey!.toLowerCase()];
+      if (typeof headerVal !== 'string' || !headerVal.trim()) {
+        res.status(400).json({ error: `Missing or invalid "${config.storageHeaderKey}" header` });
+        return;
+      }
+      memoryKey = headerVal.trim();
+    }
+    const server = createMcpServer(memoryKey, config);
+    const transport = new SSEServerTransport('/message', res);
+    await server.connect(transport);
+    const sessionId = transport.sessionId;
+    sessions.push({ memoryKey, server, transport, sessionId });
+    console.log(`[${sessionId}] SSE connected for key: "${memoryKey}"`);
     transport.onclose = () => {
-      log(`[${sessionId}] SSE closed`)
-      sessions = sessions.filter(s => s.transport !== transport)
-    }
+      console.log(`[${sessionId}] SSE connection closed`);
+      sessions = sessions.filter(s => s.transport !== transport);
+    };
     transport.onerror = (err: Error) => {
-      logErr(`[${sessionId}] SSE error:`, err)
-      sessions = sessions.filter(s => s.transport !== transport)
-    }
+      console.error(`[${sessionId}] SSE error:`, err);
+      sessions = sessions.filter(s => s.transport !== transport);
+    };
     req.on('close', () => {
-      log(`[${sessionId}] SSE client disconnected`)
-      sessions = sessions.filter(s => s.transport !== transport)
-    })
-  })
+      console.log(`[${sessionId}] Client disconnected`);
+      sessions = sessions.filter(s => s.transport !== transport);
+    });
+  });
 
-  app.post('/message', async (req: Request, res: Response) => {
-    const sessionId = req.query.sessionId as string
+  app.post('/message', async (req: Request, res: ExpressResponse) => {
+    const sessionId = req.query.sessionId as string;
     if (!sessionId) {
-      logErr('Missing sessionId')
-      res.status(400).send({ error: 'Missing sessionId' })
-      return
+      console.error('Missing sessionId');
+      res.status(400).send({ error: 'Missing sessionId' });
+      return;
     }
-    const target = sessions.find(s => s.transport.sessionId === sessionId)
+    const target = sessions.find(s => s.sessionId === sessionId);
     if (!target) {
-      logErr(`No active session for sessionId=${sessionId}`)
-      res.status(404).send({ error: 'No active session' })
-      return
+      console.error(`No active session for sessionId=${sessionId}`);
+      res.status(404).send({ error: 'No active session' });
+      return;
     }
     try {
-      await target.transport.handlePostMessage(req, res)
+      await target.transport.handlePostMessage(req, res);
     } catch (err: any) {
-      logErr(`[${sessionId}] Error handling /message:`, err)
-      res.status(500).send({ error: 'Internal error' })
+      console.error(`[${sessionId}] Error handling /message:`, err);
+      res.status(500).send({ error: 'Internal error' });
     }
-  })
+  });
 
-  app.listen(port, () => {
-    log(`Listening on port ${port} (${argv.transport})${sendOnly ? ' [SEND-ONLY MODE]' : ''}`)
-  })
+  app.listen(config.port, () => {
+    console.log(`Listening on port ${config.port} (${argv.transport})${config.sendOnly ? ' [SEND-ONLY MODE]' : ''}`);
+  });
 }
 
-main()
+main();
