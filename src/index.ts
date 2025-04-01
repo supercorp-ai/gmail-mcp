@@ -19,19 +19,31 @@ import { visit, SKIP } from 'unist-util-visit'
 import { Redis } from '@upstash/redis'
 
 // --------------------------------------------------------------------
+// Helper: JSON Response Formatter
+// --------------------------------------------------------------------
+function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(data, null, 2)
+      }
+    ]
+  };
+}
+
+// --------------------------------------------------------------------
 // Configuration & Storage Interface
 // --------------------------------------------------------------------
 interface Config {
   port: number;
   transport: 'sse' | 'stdio';
   storage: 'memory-single' | 'memory' | 'upstash-redis-rest';
-  // Gmail credentials (provided via CLI instead of env)
   googleClientId: string;
   googleClientSecret: string;
   googleRedirectUri: string;
   sendOnly: boolean;
   googleState?: string;
-  // Storage options:
   storageHeaderKey?: string;
   upstashRedisRestUrl?: string;
   upstashRedisRestToken?: string;
@@ -95,7 +107,6 @@ function getScopes(sendOnly: boolean): string[] {
       ];
 }
 
-// Create an OAuth2 client using stored refresh token if available.
 async function createOAuth2Client(config: Config, storage: Storage, memoryKey: string): Promise<OAuth2Client> {
   const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
   const stored = await storage.get(memoryKey);
@@ -111,17 +122,14 @@ async function getGmailClient(config: Config, storage: Storage, memoryKey: strin
 }
 
 function getAuthUrl(config: Config, memoryKey: string, storage: Storage): string {
-  // Generate the auth URL using Google's OAuth2Client generateAuthUrl.
-  // Use offline access, prompt consent, and the appropriate scopes.
   const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
   const scopes = getScopes(config.sendOnly);
-  const url = client.generateAuthUrl({
+  return client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
     scope: scopes,
     state: config.googleState
   });
-  return url;
 }
 
 async function exchangeAuthCode(code: string, config: Config, storage: Storage, memoryKey: string): Promise<string> {
@@ -131,13 +139,12 @@ async function exchangeAuthCode(code: string, config: Config, storage: Storage, 
     throw new Error('No refresh token returned by Google.');
   }
   client.setCredentials(tokens);
-  // Save the refresh token (and optionally access token) in storage.
   await storage.set(memoryKey, { refreshToken: tokens.refresh_token, accessToken: tokens.access_token });
   return tokens.refresh_token;
 }
 
 // --------------------------------------------------------------------
-// Helpers: HTML-to-Markdown, building MIME messages, etc.
+// HTML/Markdown Helpers
 // --------------------------------------------------------------------
 function dropUnsupportedNodes() {
   const whitelist = new Set([
@@ -279,8 +286,8 @@ async function readEmail(messageId: string, config: Config, storage: Storage, me
   }
   const headers = resp.data.payload.headers;
   const subject = getHeaderValue(headers, 'subject');
-  const from    = getHeaderValue(headers, 'from');
-  const to      = getHeaderValue(headers, 'to');
+  const from = getHeaderValue(headers, 'from');
+  const to = getHeaderValue(headers, 'to');
   const parts: { mimeType?: string; text: string }[] = [];
   function traverse(p?: gmail_v1.Schema$MessagePart) {
     if (!p) return;
@@ -409,17 +416,6 @@ async function sendEmailOnly(args: {
   return toTextJson(resp.data);
 }
 
-function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
-  return {
-    content: [
-      {
-        type: 'text',
-        text: JSON.stringify(data, null, 2)
-      }
-    ]
-  };
-}
-
 // --------------------------------------------------------------------
 // MCP Server Creation: Register Gmail Tools
 // --------------------------------------------------------------------
@@ -428,7 +424,6 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
     name: `Gmail MCP Server${config.sendOnly ? ' (Send-Only)' : ''} (Memory Key: ${memoryKey})`,
     version: '1.0.0'
   });
-  // Helper: get the correct Storage instance.
   const storage: Storage = config.storage === 'upstash-redis-rest'
     ? new RedisStorage(config.upstashRedisRestUrl!, config.upstashRedisRestToken!, config.storageHeaderKey!)
     : new MemoryStorage();
@@ -662,7 +657,7 @@ function saveMachineId(req: Request) {
 // --------------------------------------------------------------------
 // Main: Start the server (SSE or stdio)
 // --------------------------------------------------------------------
-function main(): void {
+async function main() {
   const argv = yargs(hideBin(process.argv))
     .option('port', { type: 'number', default: 8000 })
     .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
@@ -676,7 +671,7 @@ function main(): void {
     .option('googleClientId', { type: 'string', demandOption: true, describe: "Google Client ID" })
     .option('googleClientSecret', { type: 'string', demandOption: true, describe: "Google Client Secret" })
     .option('googleRedirectUri', { type: 'string', demandOption: true, describe: "Google Redirect URI" })
-    .option('send-only', { type: 'boolean', default: false, describe: 'If true, only expose send_email tool (gmail.send scope only).' })
+    .option('sendOnly', { type: 'boolean', default: false, describe: 'If true, only expose send_email tool (gmail.send scope only).' })
     .option('googleState', { type: 'string', describe: "Optional Google OAuth state parameter" })
     .option('storageHeaderKey', { type: 'string', describe: 'For storage "memory" or "upstash-redis-rest": the header name (or key prefix) to use.' })
     .option('upstashRedisRestUrl', { type: 'string', describe: 'Upstash Redis REST URL (if --storage=upstash-redis-rest)' })
@@ -691,7 +686,7 @@ function main(): void {
     googleClientId: argv.googleClientId,
     googleClientSecret: argv.googleClientSecret,
     googleRedirectUri: argv.googleRedirectUri,
-    sendOnly: argv['send-only'],
+    sendOnly: argv.sendOnly,
     googleState: argv.googleState,
     storageHeaderKey:
       (argv.storage === 'memory-single')
@@ -796,4 +791,7 @@ function main(): void {
   });
 }
 
-main();
+main().catch((err: any) => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});
