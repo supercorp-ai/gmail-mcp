@@ -698,6 +698,13 @@ async function main() {
     upstashRedisRestToken: argv.upstashRedisRestToken,
   };
 
+  // Additional CLI validation:
+  // 1. If upstashRedisRestUrl or upstashRedisRestToken is provided, storage must be 'upstash-redis-rest'
+  if ((argv.upstashRedisRestUrl || argv.upstashRedisRestToken) && config.storage !== 'upstash-redis-rest') {
+    console.error("Error: --upstashRedisRestUrl and --upstashRedisRestToken can only be used when --storage is 'upstash-redis-rest'.");
+    process.exit(1);
+  }
+  // 2. If storage is 'upstash-redis-rest', then both upstashRedisRestUrl and upstashRedisRestToken must be provided.
   if (config.storage === 'upstash-redis-rest') {
     if (!config.upstashRedisRestUrl || !config.upstashRedisRestUrl.trim()) {
       console.error("Error: --upstashRedisRestUrl is required for storage mode 'upstash-redis-rest'.");
@@ -708,6 +715,8 @@ async function main() {
       process.exit(1);
     }
   }
+  // 3. (Optional) If sendOnly is true, you might want to warn if extra Gmail scopes options are provided.
+  // (Not implemented here, but you could check if other flags imply non-send scopes.)
 
   if (config.transport === 'stdio') {
     const memoryKey = "single";
