@@ -426,7 +426,7 @@ async function sendEmailOnly(args: {
 // --------------------------------------------------------------------
 // MCP Server Creation: Register Gmail Tools
 // --------------------------------------------------------------------
-function createMcpServer(memoryKey: string, config: Config): McpServer {
+function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string): McpServer {
   const server = new McpServer({
     name: `Gmail MCP Server${config.sendOnly ? ' (Send-Only)' : ''} (Memory Key: ${memoryKey})`,
     version: '1.0.0'
@@ -436,7 +436,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
     : new MemoryStorage();
 
   server.tool(
-    'auth_url',
+    `${toolsPrefix}auth_url`,
     'Return an OAuth URL for Gmail. Visit this URL to grant access.',
     {
       // TODO: MCP SDK bug patch - remove when fixed
@@ -453,7 +453,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'exchange_auth_code',
+    `${toolsPrefix}exchange_auth_code`,
     'Exchange an auth code for a refresh token. This sets up Gmail authentication.',
     { code: z.string() },
     async (args: { code: string }) => {
@@ -468,7 +468,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
 
   if (config.sendOnly) {
     server.tool(
-      'send_email',
+      `${toolsPrefix}send_email`,
       'Send an email using only the gmail.send scope (no draftId required).',
       {
         sender: z.string(),
@@ -491,7 +491,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   }
 
   server.tool(
-    'list_emails',
+    `${toolsPrefix}list_emails`,
     'List Gmail messages (with snippets, pagination, etc.).',
     {
       maxResults: z.number().optional(),
@@ -510,7 +510,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'read_email',
+    `${toolsPrefix}read_email`,
     'Read a single Gmail message in full and convert HTML to Markdown.',
     { messageId: z.string() },
     async (args: { messageId: string }) => {
@@ -523,7 +523,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'list_drafts',
+    `${toolsPrefix}list_drafts`,
     'List Gmail drafts.',
     {
       maxResults: z.number().optional(),
@@ -539,7 +539,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'read_draft',
+    `${toolsPrefix}read_draft`,
     'Read a single Gmail draft in full.',
     { draftId: z.string() },
     async (args: { draftId: string }) => {
@@ -552,7 +552,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'draft_email',
+    `${toolsPrefix}draft_email`,
     'Create a new Gmail draft.',
     {
       sender: z.string(),
@@ -573,7 +573,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'update_draft',
+    `${toolsPrefix}update_draft`,
     'Update an existing Gmail draft.',
     {
       draftId: z.string(),
@@ -595,7 +595,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'delete_draft',
+    `${toolsPrefix}delete_draft`,
     'Delete a Gmail draft.',
     { draftId: z.string() },
     async (args: { draftId: string }) => {
@@ -608,7 +608,7 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'send_email',
+    `${toolsPrefix}send_email`,
     'Send an email (new or via an existing draft).',
     {
       sender: z.string(),
@@ -683,6 +683,7 @@ async function main() {
     .option('googleRedirectUri', { type: 'string', demandOption: true, describe: "Google Redirect URI" })
     .option('sendOnly', { type: 'boolean', default: false, describe: 'If true, only expose send_email tool (gmail.send scope only).' })
     .option('googleState', { type: 'string', describe: "Optional Google OAuth state parameter" })
+    .option('toolsPrefix', { type: 'string', default: '', describe: 'Prefix to add to all tool names.' })
     .option('storageHeaderKey', { type: 'string', describe: 'For storage "memory" or "upstash-redis-rest": the header name (or key prefix) to use.' })
     .option('upstashRedisRestUrl', { type: 'string', describe: 'Upstash Redis REST URL (if --storage=upstash-redis-rest)' })
     .option('upstashRedisRestToken', { type: 'string', describe: 'Upstash Redis REST token (if --storage=upstash-redis-rest)' })
@@ -708,6 +709,8 @@ async function main() {
     upstashRedisRestToken: argv.upstashRedisRestToken,
   };
 
+  const toolsPrefix: string = argv.toolsPrefix as string;
+
   // Extra validation for Upstash mode
   if ((argv.upstashRedisRestUrl || argv.upstashRedisRestToken) && config.storage !== 'upstash-redis-rest') {
     console.error("Error: --upstashRedisRestUrl and --upstashRedisRestToken can only be used when --storage is 'upstash-redis-rest'.");
@@ -727,7 +730,7 @@ async function main() {
   // stdio
   if (config.transport === 'stdio') {
     const memoryKey = "single";
-    const server = createMcpServer(memoryKey, config);
+    const server = createMcpServer(memoryKey, config, toolsPrefix);
     const transport = new StdioServerTransport();
     void server.connect(transport);
     console.log('Listening on stdio');
@@ -760,7 +763,7 @@ async function main() {
     }
 
     function createServerFor(memoryKey: string) {
-      return createMcpServer(memoryKey, config);
+      return createMcpServer(memoryKey, config, toolsPrefix);
     }
 
     // POST / — JSON-RPC input; initializes a session if none exists
@@ -909,7 +912,7 @@ async function main() {
       }
       memoryKey = headerVal.trim();
     }
-    const server = createMcpServer(memoryKey, config);
+    const server = createMcpServer(memoryKey, config, toolsPrefix);
     const transport = new SSEServerTransport('/message', res);
     await server.connect(transport);
     const sessionId = transport.sessionId;
